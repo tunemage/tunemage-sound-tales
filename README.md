@@ -26,12 +26,14 @@ python3 -m venv .venv
 |---|---|
 | `midigen/patterns.py` | **音楽パターンの定義。実験で編集するのはここだけ**(プリセットA〜Dと `chord_progression_pattern`) |
 | `midigen/chords.py` | コード記号(`Am` など)→構成音の解析・変換。CLIに依存しない |
+| `midigen/transforms.py` | `Pattern` → 変更した新しい `Pattern`。いまは `shift_offbeats`(裏拍ずらし) |
 | `midigen/model.py` | `Note`(音程・開始拍・長さ拍・ベロシティ)、`Track`、`Pattern`(BPM・拍子) |
 | `midigen/writer.py` | `Pattern` → `.mid` の書き出し(パターンの中身は知らない) |
 | `midigen/reader.py` | `.mid` を拍単位で読み戻す(検証・確認用) |
 | `generate.py` | コマンドライン入口(引数を解釈して `Pattern` を作り、`write_midi` に渡すだけ) |
 | `tests/test_midi.py` | プリセットA・B・CのMIDI検証テスト |
 | `tests/test_odd_meter.py` | プリセットD(7/8拍子)のテスト |
+| `tests/test_offbeat.py` | 裏拍ずらし(Python・CLI・エラー)のテスト |
 | `tests/test_chords.py` | コード進行(解析・CLI・エラー・Python入口との等価性)のテスト |
 | `output/` | 生成済みMIDI |
 
@@ -64,6 +66,7 @@ python3 -m venv .venv
 ```text
 generate.py [プリセット名 ...] [--bpm N] [--out-dir DIR]                      # プリセット生成
 generate.py --chords CHORD [CHORD ...] [--bpm N] [--bars N] [--out-dir DIR | --output FILE]   # コード進行
+# どちらにも追加できる: [--offbeat-shift BEATS [--offbeat-tracks TRACK [TRACK ...]]]   # 裏拍ずらし
 ```
 
 | 引数 | 内容 |
@@ -74,9 +77,11 @@ generate.py --chords CHORD [CHORD ...] [--bpm N] [--bars N] [--out-dir DIR | --o
 | `--bars N` | `--chords` のみ。既定=コード数。コード数より多いと進行を先頭から繰り返す。**コード数より少ないとエラー**(コードを黙って捨てない) |
 | `--out-dir DIR` | 出力ディレクトリ。既定 `output`。ファイル名は自動(下記) |
 | `--output FILE` | `--chords` のみ。出力ファイルを直接指定(`--out-dir` より優先)。親ディレクトリは自動作成 |
+| `--offbeat-shift BEATS` | 裏拍のノートを BEATS 拍ずらす(下の「裏拍ずらし」)。**正=後ろ、負=前**。-0.5〜0.5(両端は不可)。プリセットと `--chords` のどちらにも使える |
+| `--offbeat-tracks TRACK ...` | `--offbeat-shift` の対象トラック。`drums` `bass` `chords`(大文字小文字は区別しない)。省略時は全トラック。`--offbeat-shift` なしではエラー |
 
 **出力ファイル名(自動)**: プリセットは `pattern_a_8beat.mid` など、コード進行は `chords_C-Am-F-G.mid`
-(`#` は `s` に置換: `F#` → `Fs`)。`--bpm` を指定すると末尾に `_90bpm` が付きます。
+(`#` は `s` に置換: `F#` → `Fs`)。`--bpm` を指定すると末尾に `_90bpm`、`--offbeat-shift` を指定すると `_offbeat0.1667`(対象トラック指定時はさらに `_drums-bass` など)が付きます。
 
 **対応するコード記法**: ルート(`A`〜`G`) + 任意の `#` か `b`(1つ) + 任意の `m`(マイナー)。
 `C` `Am` `F#` `Bb` `Bbm` `E#` など。コード同士は**空白区切り**です。
@@ -120,6 +125,41 @@ pattern = chord_progression_pattern(parse_progression("C Am F G"), bpm=90, bars=
 write_midi(pattern, "output/my_progression.mid")
 ```
 
+## 裏拍ずらし (`--offbeat-shift`)
+
+スイング(裏拍を遅らせて跳ねさせる)やレイドバック/突っ込みを、元のパターンと聴き比べるための機能です。
+`midigen/transforms.py` の `shift_offbeats(pattern, amount, track_names=None)` が `Pattern` を受け取り、ずらした**新しい `Pattern`** を返します(元は変更しません)。CLIの `--offbeat-shift` は同じ関数を呼びます。
+
+**何がずれるか**
+- 対象は**8分音符の裏**、つまり**小節の頭から数えて x.5 拍の位置**(4/4なら 0.5, 1.5, 2.5, 3.5 拍)にあるノートです。7/8 では小節の長さ(3.5拍)で数えるので、2小節目の頭(通算3.5拍)は表拍として動きません。
+- **16分の裏**(x.25, x.75)は対象外です(動かしません)。
+- ノートは**長さ・音程・ベロシティを変えずに開始位置だけ**動きます。
+- 表拍のノートだけのトラック(例: ふつうのコード)は変化しません。キック・スネア・Aのベースも同様です。
+
+**量の目安(拍単位)**: `0.1667`(=1/6)で三連のスイング、`0.05〜0.1` で軽いハネ、`-0.05` でやや突っ込み。
+正=後ろ(遅らせる)、負=前(早める)。範囲は -0.5 より大きく 0.5 より小さい値です。MIDIの分解能は 1拍=480tick なので、0.125 は60tickちょうど、0.1667 は80tickに丸められます。
+
+**同じ音程のノートが重なる場合**: ずらした結果、同じ音程の次のノートに食い込むときは、**手前のノートを次の開始位置までで切ります**(音が止まらずに残るのを防ぐため)。切られたノートは長さが変わります。たとえばCのベースの最後の裏拍 3.5拍(長さ0.5)を +0.125 すると 3.625 から 4.0 までの 0.375 拍になります。**同じ音程が同じ位置に重なる場合はエラー**です(例: Bの16分ハイハットを +0.25)。
+
+```bash
+.venv/bin/python generate.py a --offbeat-shift 0.1667                       # Aの裏拍(ハイハット)を三連スイング風に
+.venv/bin/python generate.py c --offbeat-shift 0.1 --offbeat-tracks drums   # ドラムだけ。ベースは元の位置のまま
+.venv/bin/python generate.py c --offbeat-shift -0.05 --offbeat-tracks drums bass
+.venv/bin/python generate.py d --bpm 90 --offbeat-shift 0.1                 # 7/8 + 90BPM との組み合わせ
+```
+
+Pythonコードから同じものを作る場合:
+
+```python
+from midigen.patterns import pattern_c
+from midigen.transforms import shift_offbeats
+from midigen.writer import write_midi
+
+write_midi(shift_offbeats(pattern_c(), 0.1, ["drums"]), "output/c_swing_drums.mid")
+```
+
+注意: `--offbeat-tracks` は複数の値を取るので、プリセット名は**その前**に書いてください(`generate.py c --offbeat-shift 0.1 --offbeat-tracks drums`)。
+
 ## パターンの変え方 (`midigen/patterns.py`)
 
 - ハイハットの間隔: `drum_track(HIHAT_8TH)` の引数を `HIHAT_16TH` などに
@@ -138,4 +178,5 @@ write_midi(pattern, "output/my_progression.mid")
 5. **ベロシティ**: ハイハットは表拍が強く裏拍が弱い。ベロシティ表示で強弱の山ができているか。
 6. **コード**: C(ド)E(ミ)G(ソ) の3音が、4小節それぞれの頭から小節の終わりまで伸びているか。
 7. **D(7/8)**: DAWのテンポ・拍子表示が 7/8 になっているか。小節線の間隔が4/4の曲より短い(8分7つ)か。キックの位置が小節内で 1つ目・3つ目のグループの頭(8分の1個目と5個目)に来ているか。8分のグリッド表示にして数えると 2+2+3 が確認できる。
-8. **実験**: ベースの音符を1つ手でグリッドからずらしたり、ベロシティを均一にしたりして、ノリがどう変わるか聴いてみる。
+8. **裏拍ずらし**: 元のファイルと `--offbeat-shift` 付きのファイルを別トラックに並べ、ハイハット(裏拍)のノートだけがグリッドの右(正)または左(負)へずれているか確認する。表拍(キック・スネア・拍の頭のハイハット)は元の位置のままか、ベースの切れたノート(同音の重なり回避)がないかを見る。
+9. **実験**: ベースの音符を1つ手でグリッドからずらしたり、ベロシティを均一にしたりして、ノリがどう変わるか聴いてみる。
